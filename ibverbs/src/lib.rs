@@ -1259,10 +1259,36 @@ impl<'res> PreparedQueuePair<'res> {
     }
 }
 
+/// local
+pub trait LocalMemoryInfo {
+    /// lkey
+    fn lkey(&self) -> u32;
+
+    /// addr
+    fn addr(&self) -> *mut c_void;
+
+    /// len
+    fn len(&self) -> usize;
+}
+
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
     mr: *mut ffi::ibv_mr,
     data: Vec<T>,
+}
+
+impl<T> LocalMemoryInfo for &mut MemoryRegion<T> {
+    fn lkey(&self) -> u32 {
+        unsafe { *self.mr }.lkey
+    }
+
+    fn addr(&self) -> *mut c_void {
+        unsafe { *self.mr }.addr
+    }
+
+    fn len(&self) -> usize {
+        unsafe { *self.mr }.length
+    }
 }
 
 unsafe impl<T> Send for MemoryRegion<T> {}
@@ -1289,14 +1315,16 @@ impl<T> MemoryRegion<T> {
             key: unsafe { &*self.mr }.rkey,
         }
     }
-}
 
-/// A key that authorizes direct memory access to a memory region.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct RemoteKey {
-    /// The actual key value.
-    pub key: u32,
+    /// Info for accessing this buffer remotely.
+    pub fn info(&self) -> MemoryRegionInfo<T> {
+        MemoryRegionInfo {
+            addr: unsafe { &*self.mr }.addr as u64,
+            len: unsafe { &*self.mr }.length,
+            rkey: self.rkey(),
+            phantom: PhantomData::default(),
+        }
+    }
 }
 
 impl<T> Drop for MemoryRegion<T> {
@@ -1307,6 +1335,91 @@ impl<T> Drop for MemoryRegion<T> {
             panic!("{}", e);
         }
     }
+}
+
+/// A memory region that has been registered for use with RDMA.
+pub struct MemoryRegionUnowned<'a, T> {
+    mr: *mut ffi::ibv_mr,
+    data: &'a mut [T],
+}
+
+impl<'a, T> LocalMemoryInfo for &mut MemoryRegionUnowned<'a, T> {
+    fn lkey(&self) -> u32 {
+        unsafe { *self.mr }.lkey
+    }
+
+    fn addr(&self) -> *mut c_void {
+        unsafe { *self.mr }.addr
+    }
+
+    fn len(&self) -> usize {
+        unsafe { *self.mr }.length
+    }
+}
+
+unsafe impl<'a, T> Send for MemoryRegionUnowned<'a, T> {}
+unsafe impl<'a, T> Sync for MemoryRegionUnowned<'a, T> {}
+
+impl<'a, T> Deref for MemoryRegionUnowned<'a, T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        &self.data[..]
+    }
+}
+
+impl<'a, T> DerefMut for MemoryRegionUnowned<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data[..]
+    }
+}
+
+impl<'a, T> MemoryRegionUnowned<'a, T> {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    pub fn rkey(&self) -> RemoteKey {
+        RemoteKey {
+            key: unsafe { &*self.mr }.rkey,
+        }
+    }
+
+    /// Info for accessing this buffer remotely.
+    pub fn info(&self) -> MemoryRegionInfo<T> {
+        MemoryRegionInfo {
+            addr: unsafe { &*self.mr }.addr as u64,
+            len: unsafe { &*self.mr }.length,
+            rkey: self.rkey(),
+            phantom: PhantomData::default(),
+        }
+    }
+}
+
+impl<'a, T> Drop for MemoryRegionUnowned<'a, T> {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
+        }
+    }
+}
+
+/// Iaddr./
+#[derive(Serialize, Deserialize)]
+pub struct MemoryRegionInfo<T> {
+    /// Iaddr./
+    pub addr: u64,
+    /// Iaddr./
+    pub len: usize,
+    /// Iaddr.
+    pub rkey: RemoteKey,
+    phantom: PhantomData<T>,
+}
+
+/// A key that authorizes direct memory access to a memory region.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RemoteKey {
+    /// The actual key value.
+    pub key: u32,
 }
 
 /// A protection domain for a device's context.
@@ -1414,6 +1527,41 @@ impl<'ctx> ProtectionDomain<'ctx> {
             Ok(MemoryRegion { mr, data })
         }
     }
+
+    /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
+    pub fn register<'a, T: Sized + Copy + Default>(
+        &self,
+        data: &'a mut [T],
+    ) -> io::Result<MemoryRegionUnowned<'a, T>> {
+        assert!(mem::size_of::<T>() > 0);
+
+        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd,
+                data.as_mut_ptr() as *mut c_void,
+                data.len() * mem::size_of::<T>(),
+                access.0 as i32,
+            )
+        };
+
+        // TODO
+        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
+        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
+        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
+        // used by remote processes to perform Atomic and RDMA operations.  The remote process
+        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
+        // function.
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegionUnowned { mr, data })
+        }
+    }
 }
 
 impl<'a> Drop for ProtectionDomain<'a> {
@@ -1473,7 +1621,7 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post_send<T, R>(
+    pub fn post_send<T, R>(
         &mut self,
         mr: &mut MemoryRegion<T>,
         range: R,
@@ -1486,7 +1634,7 @@ impl<'res> QueuePair<'res> {
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: mem::size_of_val(range) as u32,
-            lkey: (*mr.mr).lkey,
+            lkey: unsafe { *mr.mr }.lkey,
         };
         let mut wr = ffi::ibv_send_wr {
             wr_id,
@@ -1516,10 +1664,81 @@ impl<'res> QueuePair<'res> {
         // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
         // immediately after the call returns.
 
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno =
-            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    /// Remote RDMA write.
+    pub fn post_write<'a, T, R>(
+        &mut self,
+        local_mr: impl LocalMemoryInfo,
+        local_range: R,
+        remote_mr: &MemoryRegionInfo<T>,
+        remote_index: usize,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
+    {
+        let local_slice = unsafe {
+            std::slice::from_raw_parts_mut(
+                local_mr.addr() as *mut T,
+                local_mr.len() / size_of::<T>(),
+            )
+        };
+        let local_range = local_range.index(local_slice);
+        let mut sge = ffi::ibv_sge {
+            addr: local_range.as_ptr() as u64,
+            length: mem::size_of_val(local_range) as u32,
+            lkey: local_mr.lkey(),
+        };
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote_mr.addr + remote_index as u64,
+                    rkey: remote_mr.rkey.key,
+                },
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        // TODO:
+        //
+        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
+        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
+        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
+        // returns this failing WR through bad_wr.
+        //
+        // The user should not alter or destroy AHs associated with WRs until request is fully
+        // executed and  a  work  completion  has been retrieved from the corresponding completion
+        // queue (CQ) to avoid unexpected behavior.
+        //
+        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
+        // immediately after the call returns.
+
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
@@ -1557,7 +1776,7 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub unsafe fn post_receive<T, R>(
+    pub fn post_receive<T, R>(
         &mut self,
         mr: &mut MemoryRegion<T>,
         range: R,
@@ -1570,7 +1789,7 @@ impl<'res> QueuePair<'res> {
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: mem::size_of_val(range) as u32,
-            lkey: (*mr.mr).lkey,
+            lkey: unsafe { *mr.mr }.lkey,
         };
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
@@ -1592,10 +1811,11 @@ impl<'res> QueuePair<'res> {
         // means that in all cases, the actual data of the incoming message will start at an offset
         // of 40 bytes into the buffer(s) in the scatter list.
 
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno =
-            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
