@@ -70,6 +70,7 @@ use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Range;
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -1032,16 +1033,14 @@ impl Gid {
     /// Expose the subnet_prefix component of the `Gid` as a u64. This is
     /// equivalent to accessing the `global.subnet_prefix` component of the
     /// `ffi::ibv_gid` union.
-    #[allow(dead_code)]
-    fn subnet_prefix(&self) -> u64 {
+    pub fn subnet_prefix(&self) -> u64 {
         u64::from_be_bytes(self.raw[..8].try_into().unwrap())
     }
 
     /// Expose the interface_id component of the `Gid` as a u64. This is
     /// equivalent to accessing the `global.interface_id` component of the
     /// `ffi::ibv_gid` union.
-    #[allow(dead_code)]
-    fn interface_id(&self) -> u64 {
+    pub fn interface_id(&self) -> u64 {
         u64::from_be_bytes(self.raw[8..].try_into().unwrap())
     }
 }
@@ -1260,7 +1259,7 @@ impl<'res> PreparedQueuePair<'res> {
 }
 
 /// local
-pub trait LocalMemoryInfo {
+pub trait LocalMemoryInfo<T> {
     /// lkey
     fn lkey(&self) -> u32;
 
@@ -1277,7 +1276,7 @@ pub struct MemoryRegion<T> {
     data: Vec<T>,
 }
 
-impl<T> LocalMemoryInfo for &mut MemoryRegion<T> {
+impl<T> LocalMemoryInfo<T> for &mut MemoryRegion<T> {
     fn lkey(&self) -> u32 {
         unsafe { *self.mr }.lkey
     }
@@ -1343,7 +1342,7 @@ pub struct MemoryRegionUnowned<'a, T> {
     data: &'a mut [T],
 }
 
-impl<'a, T> LocalMemoryInfo for &mut MemoryRegionUnowned<'a, T> {
+impl<'a, T> LocalMemoryInfo<T> for &mut MemoryRegionUnowned<'a, T> {
     fn lkey(&self) -> u32 {
         unsafe { *self.mr }.lkey
     }
@@ -1621,20 +1620,17 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub fn post_send<T, R>(
+    pub fn post_send<T>(
         &mut self,
-        mr: &mut MemoryRegion<T>,
-        range: R,
+        mr: impl LocalMemoryInfo<T>,
+        range: Range<usize>,
         wr_id: u64,
-    ) -> io::Result<()>
-    where
-        R: sliceindex::SliceIndex<[T], Output = [T]>,
-    {
-        let range = range.index(mr);
+    ) -> io::Result<()> {
+        assert!(range.len() < mr.len());
         let mut sge = ffi::ibv_sge {
-            addr: range.as_ptr() as u64,
-            length: mem::size_of_val(range) as u32,
-            lkey: unsafe { *mr.mr }.lkey,
+            addr: unsafe { mr.addr().add(range.start) } as u64,
+            length: (size_of::<T>() * range.len()) as u32,
+            lkey: mr.lkey(),
         };
         let mut wr = ffi::ibv_send_wr {
             wr_id,
@@ -1678,27 +1674,20 @@ impl<'res> QueuePair<'res> {
 
     #[inline]
     /// Remote RDMA write.
-    pub fn post_write<'a, T, R>(
+    pub fn post_write<T>(
         &mut self,
-        local_mr: impl LocalMemoryInfo,
-        local_range: R,
+        local_mr: impl LocalMemoryInfo<T>,
+        local_range: Range<usize>,
         remote_mr: &MemoryRegionInfo<T>,
-        remote_index: usize,
+        remote_range: Range<usize>,
         wr_id: u64,
-    ) -> io::Result<()>
-    where
-        R: sliceindex::SliceIndex<[T], Output = [T]>,
-    {
-        let local_slice = unsafe {
-            std::slice::from_raw_parts_mut(
-                local_mr.addr() as *mut T,
-                local_mr.len() / size_of::<T>(),
-            )
-        };
-        let local_range = local_range.index(local_slice);
+    ) -> io::Result<()> {
+        assert_eq!(local_range.len(), remote_range.len());
+        assert!(local_range.len() < local_mr.len());
+        assert!(remote_range.len() < remote_mr.len);
         let mut sge = ffi::ibv_sge {
-            addr: local_range.as_ptr() as u64,
-            length: mem::size_of_val(local_range) as u32,
+            addr: unsafe { local_mr.addr().add(local_range.start) } as u64,
+            length: (local_range.len() * size_of::<T>()) as u32,
             lkey: local_mr.lkey(),
         };
         let mut wr = ffi::ibv_send_wr {
@@ -1710,7 +1699,7 @@ impl<'res> QueuePair<'res> {
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                    remote_addr: remote_mr.addr + remote_index as u64,
+                    remote_addr: remote_mr.addr + remote_range.start as u64,
                     rkey: remote_mr.rkey.key,
                 },
             },
@@ -1776,20 +1765,16 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub fn post_receive<T, R>(
+    pub fn post_receive<T>(
         &mut self,
-        mr: &mut MemoryRegion<T>,
-        range: R,
+        mr: impl LocalMemoryInfo<T>,
+        range: Range<usize>,
         wr_id: u64,
-    ) -> io::Result<()>
-    where
-        R: sliceindex::SliceIndex<[T], Output = [T]>,
-    {
-        let range = range.index(mr);
+    ) -> io::Result<()> {
         let mut sge = ffi::ibv_sge {
-            addr: range.as_ptr() as u64,
-            length: mem::size_of_val(range) as u32,
-            lkey: unsafe { *mr.mr }.lkey,
+            addr: unsafe { mr.addr().add(range.start) } as u64,
+            length: (size_of::<T>() * mr.len()) as u32,
+            lkey: mr.lkey(),
         };
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
