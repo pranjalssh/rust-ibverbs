@@ -70,7 +70,7 @@ use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::Range;
+use std::ops::RangeBounds;
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -1258,36 +1258,128 @@ impl<'res> PreparedQueuePair<'res> {
     }
 }
 
-/// local
-pub trait LocalMemoryInfo<T> {
-    /// lkey
-    fn lkey(&self) -> u32;
+/// Local memory slice.
+#[derive(Debug)]
+pub struct LocalMemorySlice<'a, T> {
+    addr: u64,
+    lkey: u32,
+    len: usize,
+    phantom: PhantomData<&'a T>,
+}
 
-    /// addr
-    fn addr(&self) -> *mut c_void;
+impl<'a, T> LocalMemorySlice<'a, T> {
+    /// Number of T elements in this slice.
+    pub fn len(&self) -> usize {
+        self.len / size_of::<T>()
+    }
 
-    /// len
-    fn len(&self) -> usize;
+    /// Make a subslice of this slice.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
+        let start = match bounds.start_bound() {
+            std::ops::Bound::Included(i) => *i,
+            std::ops::Bound::Excluded(i) => *i + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match bounds.end_bound() {
+            std::ops::Bound::Included(i) => *i + 1,
+            std::ops::Bound::Excluded(i) => *i,
+            std::ops::Bound::Unbounded => self.len(),
+        };
+        let len = end - start;
+        Self {
+            addr: self.addr + (start * size_of::<T>()) as u64,
+            lkey: self.lkey,
+            len: len * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
+}
+
+impl<T> From<&MemoryRegion<T>> for LocalMemorySlice<'static, T> {
+    fn from(mr: &MemoryRegion<T>) -> Self {
+        Self {
+            addr: unsafe { *mr.mr }.addr as u64,
+            lkey: unsafe { *mr.mr }.lkey,
+            len: mr.len() * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> From<&MemoryRegionUnowned<'a, T>> for LocalMemorySlice<'a, T> {
+    fn from(mr: &MemoryRegionUnowned<'a, T>) -> Self {
+        Self {
+            addr: unsafe { *mr.mr }.addr as u64,
+            lkey: unsafe { *mr.mr }.lkey,
+            len: mr.len() * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
+}
+
+/// Remote memory slice.
+#[derive(Serialize, Deserialize)]
+pub struct RemoteMemorySlice<T> {
+    addr: u64,
+    len: usize,
+    rkey: u32,
+    phantom: PhantomData<T>,
+}
+
+impl<T> RemoteMemorySlice<T> {
+    /// Number of T elements in this slice.
+    pub fn len(&self) -> usize {
+        self.len / size_of::<T>()
+    }
+
+    /// Make a subslice of this slice.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
+        let start = match bounds.start_bound() {
+            std::ops::Bound::Included(i) => *i,
+            std::ops::Bound::Excluded(i) => *i + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match bounds.end_bound() {
+            std::ops::Bound::Included(i) => *i + 1,
+            std::ops::Bound::Excluded(i) => *i,
+            std::ops::Bound::Unbounded => self.len(),
+        };
+        let len = end - start;
+        Self {
+            addr: self.addr + (start * size_of::<T>()) as u64,
+            rkey: self.rkey,
+            len: len * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
+}
+
+impl<T> From<&MemoryRegion<T>> for RemoteMemorySlice<T> {
+    fn from(mr: &MemoryRegion<T>) -> Self {
+        Self {
+            addr: unsafe { *mr.mr }.addr as u64,
+            rkey: unsafe { *mr.mr }.rkey,
+            len: mr.len() * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
+}
+
+impl<'a, T> From<&MemoryRegionUnowned<'a, T>> for RemoteMemorySlice<T> {
+    fn from(mr: &MemoryRegionUnowned<'a, T>) -> Self {
+        Self {
+            addr: unsafe { *mr.mr }.addr as u64,
+            rkey: unsafe { *mr.mr }.rkey,
+            len: mr.len() * size_of::<T>(),
+            phantom: Default::default(),
+        }
+    }
 }
 
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
     mr: *mut ffi::ibv_mr,
     data: Vec<T>,
-}
-
-impl<T> LocalMemoryInfo<T> for &mut MemoryRegion<T> {
-    fn lkey(&self) -> u32 {
-        unsafe { *self.mr }.lkey
-    }
-
-    fn addr(&self) -> *mut c_void {
-        unsafe { *self.mr }.addr
-    }
-
-    fn len(&self) -> usize {
-        unsafe { *self.mr }.length
-    }
 }
 
 unsafe impl<T> Send for MemoryRegion<T> {}
@@ -1314,16 +1406,6 @@ impl<T> MemoryRegion<T> {
             key: unsafe { &*self.mr }.rkey,
         }
     }
-
-    /// Info for accessing this buffer remotely.
-    pub fn info(&self) -> MemoryRegionInfo<T> {
-        MemoryRegionInfo {
-            addr: unsafe { &*self.mr }.addr as u64,
-            len: unsafe { &*self.mr }.length,
-            rkey: self.rkey(),
-            phantom: PhantomData::default(),
-        }
-    }
 }
 
 impl<T> Drop for MemoryRegion<T> {
@@ -1340,20 +1422,6 @@ impl<T> Drop for MemoryRegion<T> {
 pub struct MemoryRegionUnowned<'a, T> {
     mr: *mut ffi::ibv_mr,
     data: &'a mut [T],
-}
-
-impl<'a, T> LocalMemoryInfo<T> for &mut MemoryRegionUnowned<'a, T> {
-    fn lkey(&self) -> u32 {
-        unsafe { *self.mr }.lkey
-    }
-
-    fn addr(&self) -> *mut c_void {
-        unsafe { *self.mr }.addr
-    }
-
-    fn len(&self) -> usize {
-        unsafe { *self.mr }.length
-    }
 }
 
 unsafe impl<'a, T> Send for MemoryRegionUnowned<'a, T> {}
@@ -1379,16 +1447,6 @@ impl<'a, T> MemoryRegionUnowned<'a, T> {
             key: unsafe { &*self.mr }.rkey,
         }
     }
-
-    /// Info for accessing this buffer remotely.
-    pub fn info(&self) -> MemoryRegionInfo<T> {
-        MemoryRegionInfo {
-            addr: unsafe { &*self.mr }.addr as u64,
-            len: unsafe { &*self.mr }.length,
-            rkey: self.rkey(),
-            phantom: PhantomData::default(),
-        }
-    }
 }
 
 impl<'a, T> Drop for MemoryRegionUnowned<'a, T> {
@@ -1399,18 +1457,6 @@ impl<'a, T> Drop for MemoryRegionUnowned<'a, T> {
             panic!("{}", e);
         }
     }
-}
-
-/// Iaddr./
-#[derive(Serialize, Deserialize)]
-pub struct MemoryRegionInfo<T> {
-    /// Iaddr./
-    pub addr: u64,
-    /// Iaddr./
-    pub len: usize,
-    /// Iaddr.
-    pub rkey: RemoteKey,
-    phantom: PhantomData<T>,
 }
 
 /// A key that authorizes direct memory access to a memory region.
@@ -1620,17 +1666,16 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub fn post_send<T>(
+    pub fn post_send<'a, T: 'a + std::fmt::Debug>(
         &mut self,
-        mr: impl LocalMemoryInfo<T>,
-        range: Range<usize>,
+        local: impl Into<LocalMemorySlice<'a, T>>,
         wr_id: u64,
     ) -> io::Result<()> {
-        assert!(range.len() < mr.len());
+        let local: LocalMemorySlice<'a, T> = local.into();
         let mut sge = ffi::ibv_sge {
-            addr: unsafe { mr.addr().add(range.start) } as u64,
-            length: (size_of::<T>() * range.len()) as u32,
-            lkey: mr.lkey(),
+            addr: local.addr,
+            length: local.len as u32,
+            lkey: local.lkey,
         };
         let mut wr = ffi::ibv_send_wr {
             wr_id,
@@ -1674,21 +1719,18 @@ impl<'res> QueuePair<'res> {
 
     #[inline]
     /// Remote RDMA write.
-    pub fn post_write<T>(
+    pub fn post_write<'a, T: 'a>(
         &mut self,
-        local_mr: impl LocalMemoryInfo<T>,
-        local_range: Range<usize>,
-        remote_mr: &MemoryRegionInfo<T>,
-        remote_range: Range<usize>,
+        local: impl Into<LocalMemorySlice<'a, T>>,
+        remote: impl Into<RemoteMemorySlice<T>>,
         wr_id: u64,
     ) -> io::Result<()> {
-        assert_eq!(local_range.len(), remote_range.len());
-        assert!(local_range.len() < local_mr.len());
-        assert!(remote_range.len() < remote_mr.len);
+        let local: LocalMemorySlice<'a, T> = local.into();
+        let remote: RemoteMemorySlice<T> = remote.into();
         let mut sge = ffi::ibv_sge {
-            addr: unsafe { local_mr.addr().add(local_range.start) } as u64,
-            length: (local_range.len() * size_of::<T>()) as u32,
-            lkey: local_mr.lkey(),
+            addr: local.addr,
+            length: local.len as u32,
+            lkey: local.lkey,
         };
         let mut wr = ffi::ibv_send_wr {
             wr_id,
@@ -1699,8 +1741,8 @@ impl<'res> QueuePair<'res> {
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                    remote_addr: remote_mr.addr + remote_range.start as u64,
-                    rkey: remote_mr.rkey.key,
+                    remote_addr: remote.addr,
+                    rkey: remote.rkey,
                 },
             },
             qp_type: Default::default(),
@@ -1765,16 +1807,16 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub fn post_receive<T>(
+    pub fn post_receive<'a, T: 'a + std::fmt::Debug>(
         &mut self,
-        mr: impl LocalMemoryInfo<T>,
-        range: Range<usize>,
+        local: impl Into<LocalMemorySlice<'a, T>>,
         wr_id: u64,
     ) -> io::Result<()> {
+        let local: LocalMemorySlice<'a, T> = local.into();
         let mut sge = ffi::ibv_sge {
-            addr: unsafe { mr.addr().add(range.start) } as u64,
-            length: (size_of::<T>() * mr.len()) as u32,
-            lkey: mr.lkey(),
+            addr: local.addr,
+            length: local.len as u32,
+            lkey: local.lkey,
         };
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
