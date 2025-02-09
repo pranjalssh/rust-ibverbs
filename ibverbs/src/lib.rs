@@ -599,8 +599,10 @@ impl<'res> QueuePairBuilder<'res> {
         pd: &'pd ProtectionDomain<'_>,
         send: &'scq CompletionQueue<'_>,
         max_send_wr: u32,
+        max_send_sge: u32,
         recv: &'rcq CompletionQueue<'_>,
         max_recv_wr: u32,
+        max_recv_sge: u32,
         qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder<'res>
     where
@@ -618,8 +620,8 @@ impl<'res> QueuePairBuilder<'res> {
             recv,
             max_recv_wr,
 
-            max_send_sge: 1,
-            max_recv_sge: 1,
+            max_send_sge,
+            max_recv_sge,
             max_inline_data: 0,
 
             qp_type,
@@ -889,11 +891,38 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// The maximum number of scatter/gather elements in any Work Request
+    /// that can be posted to the Send Queue in that Queue Pair.
+    ///
+    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
+    /// for specific transport types may support less scatter/gather elements
+    /// than the maximum reported value.
+    ///
+    /// Defaults to 1.
+    pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
+        self.max_send_sge = max_send_sge;
+        self
+    }
+
     /// Set the maximum number of receive requests in the work queue
     ///
     /// Defaults to 1.
     pub fn set_max_recv_wr(&mut self, max_recv_wr: u32) -> &mut Self {
         self.max_recv_wr = max_recv_wr;
+        self
+    }
+
+    /// The maximum number of scatter/gather elements in any Work Request
+    /// that can be posted to the Receive Queue in that Queue Pair.
+    ///
+    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
+    /// for specific transport types may support less scatter/gather elements
+    /// than the maximum reported value. This value is ignored if the
+    /// Queue Pair is associated with an SRQ.
+    ///
+    /// Defaults to 1.
+    pub fn set_max_recv_sge(&mut self, max_recv_sge: u32) -> &mut Self {
+        self.max_recv_sge = max_recv_sge;
         self
     }
 
@@ -1488,7 +1517,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
         'rcq: 'res,
         'pd: 'res,
     {
-        QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
+        QueuePairBuilder::new(self, send, 1, 1, recv, 1, 1, qp_type)
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
