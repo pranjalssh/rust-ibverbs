@@ -1258,120 +1258,67 @@ impl<'res> PreparedQueuePair<'res> {
     }
 }
 
+fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, u32) {
+    let start = match bounds.start_bound() {
+        std::ops::Bound::Included(i) => *i,
+        std::ops::Bound::Excluded(i) => *i + 1,
+        std::ops::Bound::Unbounded => 0,
+    }
+    .checked_mul(size_of::<T>())
+    .unwrap();
+    let end = match bounds.end_bound() {
+        std::ops::Bound::Included(i) => (*i + 1).checked_mul(size_of::<T>()).unwrap(),
+        std::ops::Bound::Excluded(i) => i.checked_mul(size_of::<T>()).unwrap(),
+        std::ops::Bound::Unbounded => bytes_len,
+    };
+    assert!(start <= bytes_len);
+    assert!(end <= bytes_len);
+    let addr = addr + start as u64;
+    let len: u32 = (end - start).try_into().unwrap();
+    (addr, len)
+}
+
 /// Local memory slice.
-#[derive(Debug)]
-pub struct LocalMemorySlice<'a, T> {
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct LocalMemorySlice<'a> {
     addr: u64,
+    length: u32,
     lkey: u32,
-    len: usize,
-    phantom: PhantomData<&'a T>,
-}
-
-impl<'a, T> LocalMemorySlice<'a, T> {
-    /// Number of T elements in this slice.
-    pub fn len(&self) -> usize {
-        self.len / size_of::<T>()
-    }
-
-    /// Make a subslice of this slice.
-    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
-        let start = match bounds.start_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i + 1,
-            std::ops::Bound::Unbounded => 0,
-        };
-        let end = match bounds.end_bound() {
-            std::ops::Bound::Included(i) => *i + 1,
-            std::ops::Bound::Excluded(i) => *i,
-            std::ops::Bound::Unbounded => self.len(),
-        };
-        let len = end - start;
-        Self {
-            addr: self.addr + (start * size_of::<T>()) as u64,
-            lkey: self.lkey,
-            len: len * size_of::<T>(),
-            phantom: Default::default(),
-        }
-    }
-}
-
-impl<T> From<&MemoryRegion<T>> for LocalMemorySlice<'static, T> {
-    fn from(mr: &MemoryRegion<T>) -> Self {
-        Self {
-            addr: unsafe { *mr.mr }.addr as u64,
-            lkey: unsafe { *mr.mr }.lkey,
-            len: mr.len() * size_of::<T>(),
-            phantom: Default::default(),
-        }
-    }
-}
-
-impl<'a, T> From<&MemoryRegionUnowned<'a, T>> for LocalMemorySlice<'a, T> {
-    fn from(mr: &MemoryRegionUnowned<'a, T>) -> Self {
-        Self {
-            addr: unsafe { *mr.mr }.addr as u64,
-            lkey: unsafe { *mr.mr }.lkey,
-            len: mr.len() * size_of::<T>(),
-            phantom: Default::default(),
-        }
-    }
+    phantom: PhantomData<&'a ()>,
 }
 
 /// Remote memory slice.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct RemoteMemorySlice {
+    addr: u64,
+    length: u32,
+    rkey: u32,
+}
+
+/// Remote memory region.
 #[derive(Serialize, Deserialize)]
-pub struct RemoteMemorySlice<T> {
+pub struct RemoteMemoryRegion<T> {
     addr: u64,
     len: usize,
     rkey: u32,
     phantom: PhantomData<T>,
 }
 
-impl<T> RemoteMemorySlice<T> {
+impl<T> RemoteMemoryRegion<T> {
     /// Number of T elements in this slice.
     pub fn len(&self) -> usize {
         self.len / size_of::<T>()
     }
 
     /// Make a subslice of this slice.
-    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
-        let start = match bounds.start_bound() {
-            std::ops::Bound::Included(i) => *i,
-            std::ops::Bound::Excluded(i) => *i + 1,
-            std::ops::Bound::Unbounded => 0,
-        };
-        let end = match bounds.end_bound() {
-            std::ops::Bound::Included(i) => *i + 1,
-            std::ops::Bound::Excluded(i) => *i,
-            std::ops::Bound::Unbounded => self.len(),
-        };
-        let len = end - start;
-        Self {
-            addr: self.addr + (start * size_of::<T>()) as u64,
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> RemoteMemorySlice {
+        let (addr, len) = calc_addr_len::<T>(bounds, self.addr, self.len);
+        RemoteMemorySlice {
+            addr,
+            length: len,
             rkey: self.rkey,
-            len: len * size_of::<T>(),
-            phantom: Default::default(),
-        }
-    }
-}
-
-impl<T> From<&MemoryRegion<T>> for RemoteMemorySlice<T> {
-    fn from(mr: &MemoryRegion<T>) -> Self {
-        Self {
-            addr: unsafe { *mr.mr }.addr as u64,
-            rkey: unsafe { *mr.mr }.rkey,
-            len: mr.len() * size_of::<T>(),
-            phantom: Default::default(),
-        }
-    }
-}
-
-impl<'a, T> From<&MemoryRegionUnowned<'a, T>> for RemoteMemorySlice<T> {
-    fn from(mr: &MemoryRegionUnowned<'a, T>) -> Self {
-        Self {
-            addr: unsafe { *mr.mr }.addr as u64,
-            rkey: unsafe { *mr.mr }.rkey,
-            len: mr.len() * size_of::<T>(),
-            phantom: Default::default(),
         }
     }
 }
@@ -1404,6 +1351,31 @@ impl<T> MemoryRegion<T> {
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey {
             key: unsafe { &*self.mr }.rkey,
+        }
+    }
+
+    /// Remote region.
+    pub fn remote(&self) -> RemoteMemoryRegion<T> {
+        RemoteMemoryRegion {
+            addr: unsafe { *self.mr }.addr as u64,
+            len: unsafe { *self.mr }.length,
+            rkey: unsafe { *self.mr }.rkey,
+            phantom: Default::default(),
+        }
+    }
+
+    /// Make a subslice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+        let (addr, len) = calc_addr_len::<T>(
+            bounds,
+            unsafe { *self.mr }.addr as u64,
+            unsafe { *self.mr }.length,
+        );
+        LocalMemorySlice {
+            addr,
+            length: len,
+            lkey: unsafe { *self.mr }.lkey,
+            phantom: Default::default(),
         }
     }
 }
@@ -1445,6 +1417,21 @@ impl<'a, T> MemoryRegionUnowned<'a, T> {
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey {
             key: unsafe { &*self.mr }.rkey,
+        }
+    }
+
+    /// Make a subslice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+        let (addr, len) = calc_addr_len::<T>(
+            bounds,
+            unsafe { *self.mr }.addr as u64,
+            unsafe { *self.mr }.length,
+        );
+        LocalMemorySlice {
+            addr,
+            length: len,
+            lkey: unsafe { *self.mr }.lkey,
+            phantom: Default::default(),
         }
     }
 }
@@ -1592,6 +1579,12 @@ impl<'ctx> ProtectionDomain<'ctx> {
                 access.0 as i32,
             )
         };
+        // println!(
+        //     "REGISTERED {:#x} with LEN={} asdasdasd {:#x}",
+        //     data.as_mut_ptr() as u64,
+        //     data.len() * mem::size_of::<T>(),
+        //     unsafe { *mr }.addr as u64
+        // );
 
         // TODO
         // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
@@ -1666,22 +1659,13 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub fn post_send<'a, T: 'a + std::fmt::Debug>(
-        &mut self,
-        local: impl Into<LocalMemorySlice<'a, T>>,
-        wr_id: u64,
-    ) -> io::Result<()> {
-        let local: LocalMemorySlice<'a, T> = local.into();
-        let mut sge = ffi::ibv_sge {
-            addr: local.addr,
-            length: local.len as u32,
-            lkey: local.lkey,
-        };
+    pub fn post_send<'a>(&mut self, local: &[LocalMemorySlice<'a>], wr_id: u64) -> io::Result<()> {
+        // println!("SENDING: {:#x}, len={}", local.addr, local.len);
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: &mut sge as *mut _,
-            num_sge: 1,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: Default::default(),
@@ -1721,21 +1705,15 @@ impl<'res> QueuePair<'res> {
     /// Remote RDMA write.
     pub fn post_write<'a, T: 'a>(
         &mut self,
-        local: impl Into<LocalMemorySlice<'a, T>>,
-        remote: impl Into<RemoteMemorySlice<T>>,
+        local: LocalMemorySlice<'a>,
+        remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
-        let local: LocalMemorySlice<'a, T> = local.into();
-        let remote: RemoteMemorySlice<T> = remote.into();
-        let mut sge = ffi::ibv_sge {
-            addr: local.addr,
-            length: local.len as u32,
-            lkey: local.lkey,
-        };
+        let mut local = unsafe { std::mem::transmute(local) };
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: &mut sge as *mut _,
+            sg_list: &mut local as *mut _,
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
@@ -1807,22 +1785,17 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub fn post_receive<'a, T: 'a + std::fmt::Debug>(
+    pub fn post_receive<'a>(
         &mut self,
-        local: impl Into<LocalMemorySlice<'a, T>>,
+        local: &[LocalMemorySlice<'a>],
         wr_id: u64,
     ) -> io::Result<()> {
-        let local: LocalMemorySlice<'a, T> = local.into();
-        let mut sge = ffi::ibv_sge {
-            addr: local.addr,
-            length: local.len as u32,
-            lkey: local.lkey,
-        };
+        // println!("RECEIVING INTO: {:#x}, len={}", local.addr, local.len);
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: &mut sge as *mut _,
-            num_sge: 1,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
         };
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
 
@@ -1857,7 +1830,7 @@ impl<'a> Drop for QueuePair<'a> {
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
 }

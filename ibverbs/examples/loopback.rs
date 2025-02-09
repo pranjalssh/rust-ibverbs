@@ -1,5 +1,3 @@
-use ibverbs::LocalMemorySlice;
-
 fn main() {
     let ctx = ibverbs::devices()
         .unwrap()
@@ -23,10 +21,8 @@ fn main() {
     let mut mr = pd.allocate::<u64>(2).unwrap();
     mr[1] = 0x42;
 
-    qp.post_receive(LocalMemorySlice::from(&mr).slice(..1), 2)
-        .unwrap();
-    qp.post_send(LocalMemorySlice::from(&mr).slice(1..), 1)
-        .unwrap();
+    qp.post_receive(&[mr.slice(..1)], 2).unwrap();
+    qp.post_send(&[mr.slice(1..)], 1).unwrap();
 
     let mut sent = false;
     let mut received = false;
