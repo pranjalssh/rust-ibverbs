@@ -30,6 +30,7 @@ fn main() {
     let mut completions = [ibverbs::ibv_wc::default(); 16];
     while !sent || !received {
         let completed = cq.wait(&mut completions[..]).unwrap();
+        println!("GOT HERE");
         assert!(completed.len() <= 2);
         for wr in completed {
             match wr.wr_id() {

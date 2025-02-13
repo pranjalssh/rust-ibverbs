@@ -435,7 +435,7 @@ impl Context {
                 self.ctx,
                 min_cq_entries,
                 ptr::null::<c_void>().offset(id) as *mut _,
-                ptr::null::<c_void>() as *mut _,
+                cc,
                 0,
             )
         };
@@ -573,6 +573,7 @@ impl<'ctx> CompletionQueue<'ctx> {
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
             let errno = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
+            println!("NEVER HERRE");
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
