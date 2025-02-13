@@ -28,10 +28,8 @@ fn main() {
     let mut received = false;
     let mut completions = [ibverbs::ibv_wc::default(); 16];
     while !sent || !received {
-        let completed = cq.poll(&mut completions[..]).unwrap();
-        if completed.is_empty() {
-            continue;
-        }
+        let completed = cq.wait(&mut completions[..]).unwrap();
+        assert!(!completed.is_empty());
         assert!(completed.len() <= 2);
         for wr in completed {
             match wr.wr_id() {

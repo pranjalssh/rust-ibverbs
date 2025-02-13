@@ -430,12 +430,17 @@ impl Context {
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
+        let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx.ptr) };
+        if cc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx.ptr,
                 min_cq_entries,
                 ptr::null::<c_void>().offset(id) as *mut _,
-                ptr::null::<c_void>() as *mut _,
+                cc,
                 0,
             )
         };
@@ -445,6 +450,7 @@ impl Context {
         } else {
             Ok(CompletionQueue {
                 _ctx: self.ctx.clone(),
+                cc,
                 cq,
             })
         }
@@ -481,6 +487,7 @@ impl Context {
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 pub struct CompletionQueue {
     _ctx: Arc<ContextHandle>,
+    cc: *mut ffi::ibv_comp_channel,
     cq: *mut ffi::ibv_cq,
 }
 
@@ -535,11 +542,58 @@ impl CompletionQueue {
             Ok(&mut completions[0..n as usize])
         }
     }
+
+    #[inline]
+    /// Waits for (possibly multiple) work completions.
+    pub fn wait<'c>(
+        &self,
+        completions: &'c mut [ffi::ibv_wc],
+    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
+        let c = completions as *mut [ffi::ibv_wc];
+
+        loop {
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
+            }
+
+            let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
+            let errno = unsafe {
+                let ops = &mut { &mut *ctx }.ops;
+                ops.req_notify_cq.as_mut().unwrap()(self.cq, 0)
+            };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
+            }
+
+            let mut out_cq = std::ptr::null_mut();
+            let mut out_cq_context = std::ptr::null_mut();
+            let errno = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+
+            assert_eq!(self.cq, out_cq);
+            unsafe {
+                ffi::ibv_ack_cq_events(self.cq, 1);
+            };
+        }
+    }
 }
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
+        }
+
+        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e);
