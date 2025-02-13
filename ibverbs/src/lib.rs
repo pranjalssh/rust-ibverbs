@@ -559,7 +559,7 @@ impl<'ctx> CompletionQueue<'ctx> {
             let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
             let errno = unsafe {
                 let ops = &mut { &mut *ctx }.ops;
-                ops.req_notify_cq.as_mut().unwrap()(self.cq, 1)
+                ops.req_notify_cq.as_mut().unwrap()(self.cq, 0)
             };
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
@@ -569,16 +569,13 @@ impl<'ctx> CompletionQueue<'ctx> {
                 return Ok(completions);
             }
 
-            println!("POLL4");
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
             let errno = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
-            println!("NEVER HERRE");
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
 
-            println!("POLL5");
             assert_eq!(self.cq, out_cq);
             unsafe {
                 ffi::ibv_ack_cq_events(self.cq, 1);
