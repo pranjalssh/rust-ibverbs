@@ -570,19 +570,6 @@ impl CompletionQueue {
                 return Ok(completions);
             }
 
-            if timeout.is_some() {
-                let mut buf = 0;
-                let rc =
-                    unsafe { libc::read((*self.cc).fd, &mut buf as *mut i32 as *mut c_void, 1) };
-                if rc < 0 {
-                    let e = io::Error::last_os_error();
-                    let raw_err = e.raw_os_error().unwrap();
-                    if raw_err != libc::EAGAIN && raw_err != libc::EWOULDBLOCK {
-                        return Err(e);
-                    }
-                }
-            }
-
             let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
             let errno = unsafe {
                 let ops = &mut { &mut *ctx }.ops;
@@ -591,36 +578,45 @@ impl CompletionQueue {
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
+
             let completions = self.poll(unsafe { &mut *c })?;
             if !completions.is_empty() {
                 return Ok(completions);
             }
 
-            if let Some(timeout) = timeout {
-                let mut pollfd = libc::pollfd {
-                    fd: unsafe { { *self.cc }.fd },
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let rc = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as libc::c_int) };
-                match rc {
-                    -1 => return Err(io::Error::last_os_error()),
-                    0 => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Timed out during completion queue wait",
-                        ))
-                    }
-                    1 => {}
-                    _ => unreachable!(),
+            let mut pollfd = libc::pollfd {
+                fd: unsafe { { *self.cc }.fd },
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut pollfd,
+                    1,
+                    timeout.map_or(-1, |x| x.as_millis() as libc::c_int),
+                )
+            };
+            match rc {
+                -1 => return Err(io::Error::last_os_error()),
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Timed out during completion queue wait",
+                    ))
                 }
+                1 => {}
+                _ => unreachable!(),
             }
 
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
-            let errno = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
-            if errno != 0 {
-                return Err(io::Error::from_raw_os_error(errno));
+            let rc = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(e);
             }
 
             assert_eq!(self.cq, out_cq);
