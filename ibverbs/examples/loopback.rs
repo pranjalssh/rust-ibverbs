@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 fn main() {
     let ctx = ibverbs::devices()
         .unwrap()
@@ -28,7 +30,9 @@ fn main() {
     let mut received = false;
     let mut completions = [ibverbs::ibv_wc::default(); 16];
     while !sent || !received {
-        let completed = cq.wait(&mut completions[..]).unwrap();
+        let completed = cq
+            .wait(&mut completions[..], Some(Duration::from_secs(1)))
+            .unwrap();
         assert!(!completed.is_empty());
         assert!(completed.len() <= 2);
         for wr in completed {

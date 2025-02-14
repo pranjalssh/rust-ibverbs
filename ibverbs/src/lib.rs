@@ -74,6 +74,7 @@ use std::ops::RangeBounds;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
@@ -435,6 +436,17 @@ impl Context {
             return Err(io::Error::last_os_error());
         }
 
+        let cc_fd = unsafe { *cc }.fd;
+        let flags = unsafe { libc::fcntl(cc_fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let rc = unsafe { libc::fcntl(cc_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx.ptr,
@@ -548,6 +560,7 @@ impl CompletionQueue {
     pub fn wait<'c>(
         &self,
         completions: &'c mut [ffi::ibv_wc],
+        timeout: Option<Duration>,
     ) -> io::Result<&'c mut [ffi::ibv_wc]> {
         let c = completions as *mut [ffi::ibv_wc];
 
@@ -555,6 +568,19 @@ impl CompletionQueue {
             let completions = self.poll(unsafe { &mut *c })?;
             if !completions.is_empty() {
                 return Ok(completions);
+            }
+
+            if timeout.is_some() {
+                let mut buf = 0;
+                let rc =
+                    unsafe { libc::read((*self.cc).fd, &mut buf as *mut i32 as *mut c_void, 1) };
+                if rc < 0 {
+                    let e = io::Error::last_os_error();
+                    let raw_err = e.raw_os_error().unwrap();
+                    if raw_err != libc::EAGAIN && raw_err != libc::EWOULDBLOCK {
+                        return Err(e);
+                    }
+                }
             }
 
             let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
@@ -568,6 +594,26 @@ impl CompletionQueue {
             let completions = self.poll(unsafe { &mut *c })?;
             if !completions.is_empty() {
                 return Ok(completions);
+            }
+
+            if let Some(timeout) = timeout {
+                let mut pollfd = libc::pollfd {
+                    fd: unsafe { { *self.cc }.fd },
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as libc::c_int) };
+                match rc {
+                    -1 => return Err(io::Error::last_os_error()),
+                    0 => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Timed out during completion queue wait",
+                        ))
+                    }
+                    1 => {}
+                    _ => unreachable!(),
+                }
             }
 
             let mut out_cq = std::ptr::null_mut();
