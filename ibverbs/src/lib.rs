@@ -325,7 +325,6 @@ impl<'devlist> Device<'devlist> {
 struct ContextHandle {
     ptr: *mut ffi::ibv_context,
     port_attr: ffi::ibv_port_attr,
-    gid_table: Vec<GidEntry>,
 }
 
 impl Drop for ContextHandle {
@@ -391,22 +390,9 @@ impl Context {
             }
         }
 
-        let mut gid_table = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
-        let num_entries = unsafe {
-            ffi::_ibv_query_gid_table(
-                ctx,
-                gid_table.as_mut_ptr(),
-                gid_table.len(),
-                0,
-                size_of::<ffi::ibv_gid_entry>(),
-            )
-        };
-        gid_table.truncate(num_entries as usize);
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
         let ctx = Arc::new(ContextHandle {
             ptr: ctx,
             port_attr,
-            gid_table,
         });
         Ok(Context { ctx })
     }
@@ -491,8 +477,21 @@ impl Context {
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
-    pub fn gid_table(&self) -> &[GidEntry] {
-        &self.ctx.gid_table
+    pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
+        let mut gid_table =
+            vec![ffi::ibv_gid_entry::default(); self.ctx.port_attr.gid_tbl_len as usize];
+        let num_entries = unsafe {
+            ffi::_ibv_query_gid_table(
+                self.ctx.ptr,
+                gid_table.as_mut_ptr(),
+                gid_table.len(),
+                0,
+                size_of::<ffi::ibv_gid_entry>(),
+            )
+        };
+        gid_table.truncate(num_entries as usize);
+        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        Ok(gid_table)
     }
 }
 
@@ -658,7 +657,7 @@ pub struct QueuePairBuilder<'res> {
     recv: &'res CompletionQueue,
     max_recv_wr: u32,
 
-    gid_index: usize,
+    gid_index: Option<u32>,
     max_send_sge: u32,
     max_recv_sge: u32,
     max_inline_data: u32,
@@ -718,7 +717,7 @@ impl<'res> QueuePairBuilder<'res> {
             ctx: 0,
             pd,
 
-            gid_index: 0,
+            gid_index: None,
             send,
             max_send_wr,
             recv,
@@ -783,9 +782,8 @@ impl<'res> QueuePairBuilder<'res> {
     /// `QueuePairEndpoint` that is passed to `QueuePair::handshake()` has a `gid`.
     ///
     /// Defaults to 0.
-    pub fn set_gid_index(&mut self, gid_index: usize) -> &mut Self {
-        assert!(gid_index < self.pd.ctx.gid_table.len());
-        self.gid_index = gid_index;
+    pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
+        self.gid_index = Some(gid_index);
         self
     }
 
@@ -1115,7 +1113,7 @@ pub struct PreparedQueuePair<'res> {
     qp: QueuePair<'res>,
 
     // carried from builder
-    gid_index: usize,
+    gid_index: Option<u32>,
     /// only valid for RC and UC
     access: Option<ffi::ibv_access_flags>,
     /// only valid for RC
@@ -1252,14 +1250,24 @@ impl<'res> PreparedQueuePair<'res> {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
-    pub fn endpoint(&self) -> QueuePairEndpoint {
+    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
         let num = unsafe { &*self.qp.qp }.qp_num;
-
-        QueuePairEndpoint {
+        let gid = if let Some(gid_index) = self.gid_index {
+            let mut gid = ffi::ibv_gid::default();
+            let rc =
+                unsafe { ffi::ibv_query_gid(self.ctx.ptr, PORT_NUM, gid_index as i32, &mut gid) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(Gid::from(gid))
+        } else {
+            None
+        };
+        Ok(QueuePairEndpoint {
             num,
             lid: self.ctx.port_attr.lid,
-            gid: Some(self.ctx.gid_table[self.gid_index].gid),
-        }
+            gid,
+        })
     }
 
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
@@ -1333,7 +1341,10 @@ impl<'res> PreparedQueuePair<'res> {
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = gid.into();
             attr.ah_attr.grh.hop_limit = 0xff;
-            attr.ah_attr.grh.sgid_index = self.gid_index as u8;
+            attr.ah_attr.grh.sgid_index = self
+                .gid_index
+                .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
+                as u8;
         }
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
