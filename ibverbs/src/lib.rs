@@ -77,6 +77,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
+const MAX_GID_TBL_LEN: usize = 32;
 
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_qp_type;
@@ -324,7 +325,46 @@ impl<'devlist> Device<'devlist> {
 
 struct ContextHandle {
     ptr: *mut ffi::ibv_context,
-    port_attr: ffi::ibv_port_attr,
+}
+
+impl ContextHandle {
+    fn query_port(&self) -> io::Result<ffi::ibv_port_attr> {
+        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
+        //
+        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
+        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
+        //   recommended avoiding saving the result of this query, or to flush them when a new SM
+        //   (re)configures the subnet.
+        //
+        let mut port_attr = ffi::ibv_port_attr::default();
+        let errno = unsafe {
+            ffi::ibv_query_port(
+                self.ptr,
+                PORT_NUM,
+                &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
+            )
+        };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
+        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+        //
+        //   The content of the GID table is valid only when the port_attr.state is either
+        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+        //   table is indeterminate.
+        //
+        match port_attr.state {
+            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "port is not ACTIVE or ARMED".to_string(),
+                ));
+            }
+        }
+        Ok(port_attr)
+    }
 }
 
 impl Drop for ContextHandle {
@@ -355,45 +395,8 @@ impl Context {
             ));
         }
 
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
-        let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe {
-            ffi::ibv_query_port(
-                ctx,
-                PORT_NUM,
-                &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
-            )
-        };
-        if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
-
-        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
-        //
-        //   The content of the GID table is valid only when the port_attr.state is either
-        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
-        //   table is indeterminate.
-        //
-        match port_attr.state {
-            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "port is not ACTIVE or ARMED".to_string(),
-                ));
-            }
-        }
-
-        let ctx = Arc::new(ContextHandle {
-            ptr: ctx,
-            port_attr,
-        });
+        let ctx = Arc::new(ContextHandle { ptr: ctx });
+        ctx.query_port()?;
         Ok(Context { ctx })
     }
 
@@ -478,8 +481,7 @@ impl Context {
 
     /// Returns the valid GID table entries of this RDMA device context.
     pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
-        let mut gid_table =
-            vec![ffi::ibv_gid_entry::default(); self.ctx.port_attr.gid_tbl_len as usize];
+        let mut gid_table = vec![ffi::ibv_gid_entry::default(); MAX_GID_TBL_LEN];
         let num_entries = unsafe {
             ffi::_ibv_query_gid_table(
                 self.ctx.ptr,
@@ -651,6 +653,7 @@ impl Drop for CompletionQueue {
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
     pd: &'res ProtectionDomain,
+    port_attr: ffi::ibv_port_attr,
 
     send: &'res CompletionQueue,
     max_send_wr: u32,
@@ -701,6 +704,7 @@ impl<'res> QueuePairBuilder<'res> {
     fn new<'scq, 'rcq, 'pd>(
         pd: &'pd ProtectionDomain,
         send: &'scq CompletionQueue,
+        port_attr: ffi::ibv_port_attr,
         max_send_wr: u32,
         max_send_sge: u32,
         recv: &'rcq CompletionQueue,
@@ -716,6 +720,7 @@ impl<'res> QueuePairBuilder<'res> {
         QueuePairBuilder {
             ctx: 0,
             pd,
+            port_attr,
 
             gid_index: None,
             send,
@@ -740,7 +745,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_dest_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(pd.ctx.port_attr.active_mtu),
+                .then_some(port_attr.active_mtu),
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
@@ -1065,6 +1070,7 @@ impl<'res> QueuePairBuilder<'res> {
         } else {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx.clone(),
+                lid: self.port_attr.lid,
                 qp: QueuePair {
                     _phantom: PhantomData,
                     qp,
@@ -1111,7 +1117,8 @@ impl<'res> QueuePairBuilder<'res> {
 pub struct PreparedQueuePair<'res> {
     ctx: Arc<ContextHandle>,
     qp: QueuePair<'res>,
-
+    /// port local identifier
+    lid: u16,
     // carried from builder
     gid_index: Option<u32>,
     /// only valid for RC and UC
@@ -1265,7 +1272,7 @@ impl<'res> PreparedQueuePair<'res> {
         };
         Ok(QueuePairEndpoint {
             num,
-            lid: self.ctx.port_attr.lid,
+            lid: self.lid,
             gid,
         })
     }
@@ -1626,13 +1633,16 @@ impl ProtectionDomain {
         send: &'scq CompletionQueue,
         recv: &'rcq CompletionQueue,
         qp_type: ffi::ibv_qp_type::Type,
-    ) -> QueuePairBuilder<'res>
+    ) -> io::Result<QueuePairBuilder<'res>>
     where
         'scq: 'res,
         'rcq: 'res,
         'pd: 'res,
     {
-        QueuePairBuilder::new(self, send, 1, 1, recv, 1, 1, qp_type)
+        let port_attr = self.ctx.query_port()?;
+        Ok(QueuePairBuilder::new(
+            self, send, port_attr, 1, 1, recv, 1, 1, qp_type,
+        ))
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
