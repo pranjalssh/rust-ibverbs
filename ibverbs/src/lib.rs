@@ -1516,7 +1516,7 @@ impl<T> MemoryRegion<T> {
     }
 
     /// Make a subslice of this memory region.
-    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+    pub fn slice(&mut self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
         let (addr, len) = calc_addr_len::<T>(
             bounds,
             unsafe { *self.mr }.addr as u64,
