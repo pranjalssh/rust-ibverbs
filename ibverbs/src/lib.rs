@@ -568,6 +568,8 @@ pub struct QueuePairBuilder<'res> {
     qp_type: ffi::ibv_qp_type::Type,
 
     // carried along to handshake phase
+    /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
+    traffic_class: Option<u8>,
     /// only valid for RC and UC
     access: Option<ffi::ibv_access_flags>,
     /// only valid for RC
@@ -645,6 +647,7 @@ impl<'res> QueuePairBuilder<'res> {
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
+            traffic_class: None,
         }
     }
 
@@ -686,6 +689,17 @@ impl<'res> QueuePairBuilder<'res> {
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
         assert!(gid_index < self.pd.ctx.gid_table.len() as u32);
         self.gid_index = Some(gid_index);
+        self
+    }
+
+    /// Sets the traffic class of the Global Routing Headers (GRH).
+    ///
+    /// This value is only used if a `gid_index` was specified. Using this value, the originator
+    /// of the packets specifies the required delivery priority for handling them by the routers.
+    ///
+    /// Defaults to unset.
+    pub fn set_traffic_class(&mut self, traffic_class: u8) -> &mut Self {
+        self.traffic_class = Some(traffic_class);
         self
     }
 
@@ -954,6 +968,7 @@ impl<'res> QueuePairBuilder<'res> {
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
+                traffic_class: self.traffic_class,
             })
         }
     }
@@ -989,6 +1004,8 @@ pub struct PreparedQueuePair<'res> {
 
     // carried from builder
     gid_index: Option<u32>,
+    /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
+    traffic_class: Option<u8>,
     /// only valid for RC and UC
     access: Option<ffi::ibv_access_flags>,
     /// only valid for RC
@@ -1217,6 +1234,9 @@ impl<'res> PreparedQueuePair<'res> {
                 .gid_index
                 .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
                 as u8;
+            if let Some(traffic_class) = self.traffic_class {
+                attr.ah_attr.grh.traffic_class = traffic_class;
+            }
         }
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
