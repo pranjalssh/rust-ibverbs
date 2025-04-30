@@ -800,8 +800,8 @@ impl QueuePairBuilder {
     /// of the packets specifies the required delivery priority for handling them by the routers.
     ///
     /// Defaults to unset.
-    pub fn set_traffic_class(&mut self, traffic_class: u8) -> &mut Self {
-        self.traffic_class = Some(traffic_class);
+    pub fn set_traffic_class(&mut self, traffic_class: Option<u8>) -> &mut Self {
+        self.traffic_class = traffic_class;
         self
     }
 
@@ -1788,6 +1788,44 @@ impl ProtectionDomain {
         // used by remote processes to perform Atomic and RDMA operations.  The remote process
         // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
         // function.
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegionUnowned {
+                _pd: self.pd.clone(),
+                mr,
+                data,
+            })
+        }
+    }
+
+    /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
+    /// https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
+    pub fn register_dmabuf<'a, T: Sized + Copy + Default>(
+        &self,
+        fd: i32,
+        iova: u64,
+        data: &'a mut [T],
+        len: usize,
+    ) -> io::Result<MemoryRegionUnowned<'a, T>> {
+        assert!(mem::size_of::<T>() > 0);
+
+        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC
+            | ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING;
+        let mr = unsafe {
+            ffi::ibv_reg_dmabuf_mr(
+                self.pd.pd,
+                0 as u64,
+                len,
+                iova,
+                fd,
+                access.0 as i32,
+            )
+        };
 
         if mr.is_null() {
             Err(io::Error::last_os_error())
