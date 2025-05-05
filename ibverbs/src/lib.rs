@@ -1800,8 +1800,17 @@ impl ProtectionDomain {
         }
     }
 
-    /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
+    /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
     /// https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - The file descriptor of the DMA-BUF to be registered. This must refer to an already allocated buffer.
+    /// * `iova` - The IO virtual address (IOVA) at which the DMA-BUF will be made accessible to the RDMA device.
+    /// * `data` - A mutable reference to the slice of data that will be associated with the registered memory region. 
+    /// * `len` - The size in bytes of the memory region to be registered. This must be aligned to page size.
+    ///
+    /// TODO: Add MemoryRegionUnownedOpaque class for return value which doesn't need to store the `data` ptr.
     pub fn register_dmabuf<'a, T: Sized + Copy + Default>(
         &self,
         fd: i32,
